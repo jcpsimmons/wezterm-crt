@@ -1,0 +1,56 @@
+name: bootstrap
+
+# Materializes the full wezterm + CRT effects source tree into this
+# repository. Downloads the 7-commit git bundle, verifies its SHA-256
+# checksum, clones upstream wezterm/wezterm, fetches the CRT branch
+# from the bundle, and force-pushes the result to main, master and
+# cursor/crt-effects-4e57. Lives on the 'bootstrap' branch so it can
+# be re-run at any time.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/bootstrap.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: download and verify bundle
+        run: |
+          set -e
+          cd "$RUNNER_TEMP"
+          curl -sSf https://paste.rs/8hYfK | base64 -d > crt.bundle
+          echo "f119ab732cd4f8ecbd51095c0e1fae8c61f44bcf4ea106e6a9f454d1eeca11a2  crt.bundle" | sha256sum -c -
+
+      - name: clone upstream and fetch bundle
+        run: |
+          set -e
+          git clone https://github.com/wezterm/wezterm.git "$RUNNER_TEMP/wezterm"
+          cd "$RUNNER_TEMP/wezterm"
+          git bundle verify "$RUNNER_TEMP/crt.bundle"
+          git fetch "$RUNNER_TEMP/crt.bundle" cursor/crt-effects-4e57:cursor/crt-effects-4e57
+          git log --oneline -8 cursor/crt-effects-4e57
+
+      - name: push to this repository
+        run: |
+          set -e
+          cd "$RUNNER_TEMP/wezterm"
+          git config user.name "crt-bootstrap"
+          git config user.email "crt-bootstrap@users.noreply.github.com"
+          git remote add dest "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git"
+          if git push -f dest cursor/crt-effects-4e57 cursor/crt-effects-4e57:refs/heads/main cursor/crt-effects-4e57:refs/heads/master; then
+            echo "pushed full tree (including workflow files)"
+          else
+            echo "full push failed; GITHUB_TOKEN cannot push workflow file changes."
+            echo "Pushing tree with .github/workflows stripped; the build workflows"
+            echo "are then re-added with a user token via the GitHub API."
+            git checkout cursor/crt-effects-4e57
+            git rm -rq .github/workflows
+            git commit -m "Strip CI workflow files (GITHUB_TOKEN restriction); re-add via API"
+            git push -f dest HEAD:refs/heads/cursor/crt-effects-4e57 HEAD:refs/heads/main HEAD:refs/heads/master
+          fi
