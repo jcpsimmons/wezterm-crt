@@ -105,17 +105,21 @@ same derived-color math that cool-retro-term applies in QML
 
 ## Keeping the fork up to date
 
-This branch carries three commits on top of upstream `main`:
+This tree carries a short commit series on top of upstream `main`
+(commit `9c04f79f`), in this order:
 
-1. the `custom_shaders` pipeline (cherry-pick of upstream PR #7649)
+1. the `custom_shaders` pipeline (based on upstream PR #7649)
 2. burn-in/bloom/fps pipeline extensions
 3. the CRT shader, Lua presets, and docs
+4. follow-up fixes (config-reload fingerprinting, unfocused-animation
+   repaints) and CI `workflow_dispatch` triggers
 
 To rebase onto latest upstream:
 
 ```sh
-git fetch origin main
-git rebase origin/main
+git remote add upstream https://github.com/wezterm/wezterm.git
+git fetch upstream main
+git rebase upstream/main
 cargo test -p config -p wezterm-gui
 ```
 
@@ -129,28 +133,19 @@ The fork reuses wezterm's own build workflows. The
 `workflow_dispatch` trigger added, so you can build installable
 packages for any branch without waiting for the nightly cron:
 
-1. On your fork, go to **Actions**, pick the platform workflow (e.g.
+1. Go to **Actions**, pick the platform workflow (e.g.
    `ubuntu24.04_continuous`, `macos_continuous`,
-   `windows_continuous`), press **Run workflow**, and select this
-   branch.
+   `windows_continuous`), press **Run workflow**, and select the
+   branch to build.
 2. The build job attaches the packages (`.deb`/`.rpm`/`.AppImage`,
    `.zip` for macOS/Windows) as workflow artifacts, downloadable from
    the run page for 5 days.
-3. The final "upload to nightly release" job additionally publishes
-   the assets to a GitHub release tagged `nightly`. For that step to
-   succeed on a fork, create the release once:
 
-   ```sh
-   gh release create nightly --prerelease --title Nightly \
-     --notes "rolling build of the CRT effects branch"
-   ```
-
-   If the release does not exist that job fails harmlessly; the
-   artifacts from step 2 are unaffected.
-
-The tag workflows (`gen_<platform>_tag.yml`) fire on tags matching
-`20*` and create versioned releases, same as upstream's release
-process, if you prefer pinned versions over the rolling nightly.
+The final "upload to nightly release" job is conditioned on running in
+the upstream `wezterm/wezterm` repository and is skipped elsewhere;
+the artifacts from step 2 are the deliverable. Upstream's tag
+workflows (`gen_<platform>_tag.yml`, versioned releases on `20*` tags)
+are available in git history if you want that release flow too.
 
 ## License note
 
