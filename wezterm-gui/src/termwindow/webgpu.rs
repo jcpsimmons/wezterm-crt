@@ -1784,6 +1784,27 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     #[test]
+    fn test_crt_shader_compiles_on_device() {
+        let Some((device, _queue)) = create_test_device() else {
+            eprintln!("Skipping test_crt_shader_compiles_on_device: no GPU adapter available");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let shader_path = dir.path().join("crt.wgsl");
+        std::fs::write(&shader_path, include_str!("../../../assets/shaders/crt.wgsl")).unwrap();
+
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let (texture_bgl, uniform_bgl) = create_test_bind_group_layouts(&device);
+        let result =
+            compile_postprocess_shader(&device, &shader_path, format, &texture_bgl, &uniform_bgl);
+        assert!(
+            result.is_some(),
+            "CRT shader should compile into a render pipeline"
+        );
+    }
+
+    #[test]
     fn test_postprocess_state_burnin_bloom() {
         let Some((device, _queue)) = create_test_device() else {
             eprintln!("Skipping test_postprocess_state_burnin_bloom: no GPU adapter available");
