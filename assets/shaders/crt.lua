@@ -9,14 +9,31 @@
 --   local crt = dofile(wezterm.config_dir .. "/crt.lua")
 --   crt.apply_to_config(config, {
 --     preset = "monochrome_green",  -- see crt.presets
---     -- any preset field can be overridden:
---     -- screen_curvature = 0.5,
---     -- rasterization = "scanlines", -- none|scanlines|pixels|subpixels
+--     -- any field below can be overridden
 --   })
 --
 -- Presets are ports of cool-retro-term's built-in profiles.
 -- The "full_color" preset keeps wezterm's own colors while adding the
 -- CRT hardware look (curvature, scanlines, bloom, burn-in, noise).
+--
+-- All cool-retro-term sliders (snake_case). Ranges are 0..1 unless noted.
+-- Full descriptions: assets/shaders/README.md
+--
+--   Effects tab:
+--     bloom, burn_in, static_noise, jitter, glowing_line,
+--     screen_curvature, ambient_light, flickering, horizontal_sync,
+--     rgb_shift (CRT's rbgShift), frame_shininess
+--   Screen / phosphor:
+--     font_color "#rrggbb", background_color "#rrggbb",
+--     chroma_color, saturation_color, contrast, brightness,
+--     rasterization = "none"|"scanlines"|"pixels"|"subpixels"
+--   Frame / geometry:
+--     frame_size (CRT frameMargin; 0 hides bezel), frame_color "#rrggbb",
+--     screen_radius, virtual_pixel_size (device px, default 3)
+--   apply_to_config extras:
+--     preset, fps (default 60), output_path, template_path
+--
+-- Not ported (use wezterm.lua): font, opacity, padding, cursor, cols/rows.
 
 local M = {}
 

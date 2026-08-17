@@ -54,21 +54,80 @@ All of cool-retro-term's built-in profiles are included:
 | `e_ink` | dark-on-paper, long burn-in |
 | `full_color` | keeps your wezterm color scheme, adds CRT hardware look |
 
-Every profile field can be overridden per call:
+Every field below can be overridden per call. Names and 0..1 ranges
+match cool-retro-term's Effects / Screen sliders (snake_case instead
+of camelCase). CRT's `rbgShift` typo is `rgb_shift` here.
 
 ```lua
 crt.apply_to_config(config, {
   preset = 'full_color',
-  screen_curvature = 0.4,      -- 0..1
-  rasterization = 'scanlines', -- none | scanlines | pixels | subpixels
-  bloom = 0.6,                 -- 0..1
-  burn_in = 0.4,               -- 0..1 phosphor trail length
-  static_noise = 0.0,
-  jitter = 0.0,
-  frame_size = 0.2,            -- bezel size, 0 disables the frame
-  virtual_pixel_size = 3.0,    -- device px per virtual CRT pixel
+  -- any field from the tables below
+  screen_curvature = 0.4,
+  bloom = 0.6,
+  burn_in = 0.4,
 })
 ```
+
+### Effects (cool-retro-term Effects tab)
+
+| option | range | what it does |
+|---|---|---|
+| `bloom` | 0..1 | phosphor glow / gaussian bloom. `0` disables the bloom pass |
+| `burn_in` | 0..1 | phosphor trail length. `0` disables the burn-in pass |
+| `static_noise` | 0..1 | analog snow, stronger toward screen center |
+| `jitter` | 0..1 | per-pixel image shake |
+| `glowing_line` | 0..1 | travelling bright scan line |
+| `screen_curvature` | 0..1 | barrel distortion |
+| `ambient_light` | 0..1 | room light on the bezel / glass glare (needs `frame_size` > 0) |
+| `flickering` | 0..1 | whole-screen brightness flicker |
+| `horizontal_sync` | 0..1 | occasional horizontal tearing / displacement |
+| `rgb_shift` | 0..1 | RGB gun misconvergence (CRT's `rbgShift`) |
+| `frame_shininess` | 0..1 | glossy bezel + screen-edge reflections |
+
+### Phosphor / color (cool-retro-term Screen tab)
+
+| option | range | what it does |
+|---|---|---|
+| `font_color` | `#rrggbb` | phosphor / foreground tint |
+| `background_color` | `#rrggbb` | tube background |
+| `chroma_color` | 0..1 | `0` = monochrome phosphor, `1` = keep source hues |
+| `saturation_color` | 0..1 | mix phosphor toward white before contrast |
+| `contrast` | 0..1 | mix between font and background colors |
+| `brightness` | 0..1 | overall gain after flicker (`0.5` is neutral) |
+| `rasterization` | see right | `none` \| `scanlines` \| `pixels` \| `subpixels` |
+
+`full_color` is `chroma_color = 1` + white `font_color`: your wezterm
+color scheme stays, CRT hardware effects still apply.
+
+### Frame / geometry
+
+| option | range | what it does |
+|---|---|---|
+| `frame_size` | 0..1 | bezel thickness. `0` hides the frame (CRT `frameMargin`) |
+| `frame_color` | `#rrggbb` | bezel color, mixed with ambient light |
+| `screen_radius` | 0..1 | rounded tube corners |
+| `virtual_pixel_size` | px, default `3` | device pixels per virtual CRT pixel. Scanlines fade out as this approaches `2` |
+
+### `apply_to_config` extras (not from CRT)
+
+| option | default | what it does |
+|---|---|---|
+| `preset` | `monochrome_green` | starting profile; overrides apply on top |
+| `fps` | `60` | shader animation cap (`custom_shader_fps`) |
+| `output_path` | `crt-generated-<preset>.wgsl` next to `crt.lua` | where the baked shader is written |
+| `template_path` | `crt.wgsl` next to `crt.lua` | shader template |
+
+### Use wezterm for these CRT settings
+
+Not ported on purpose — set them in `wezterm.lua` instead:
+
+| cool-retro-term | wezterm |
+|---|---|
+| `fontName` / `fontWidth` / `fontScaling` | `config.font`, `config.font_size`, `config.cell_width` |
+| `windowOpacity` | `config.window_background_opacity` |
+| `margin` | `config.window_padding` |
+| `blinkingCursor` | `config.default_cursor_style`, `config.cursor_blink_rate` |
+| window `width` / `height` | `config.initial_cols`, `config.initial_rows` |
 
 ## Using the shader directly
 
