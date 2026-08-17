@@ -301,10 +301,23 @@ function M.generate_shader(template, params)
     .. template:sub(block_end + 1)
 end
 
+-- wezterm's Lua sandbox does not expose the `debug` library, so fall
+-- back to the wezterm config directory when we can't introspect our
+-- own path.
 local function script_dir()
-  local source = debug.getinfo(1, "S").source
-  local path = source:match("^@(.*)$") or source
-  return path:match("^(.*)[/\\]") or "."
+  if type(debug) == "table" and debug.getinfo then
+    local source = debug.getinfo(1, "S").source
+    local path = source:match("^@(.*)$") or source
+    local dir = path:match("^(.*)[/\\]")
+    if dir then
+      return dir
+    end
+  end
+  local ok, wezterm = pcall(require, "wezterm")
+  if ok and wezterm.config_dir then
+    return wezterm.config_dir
+  end
+  return "."
 end
 
 local function read_file(path)

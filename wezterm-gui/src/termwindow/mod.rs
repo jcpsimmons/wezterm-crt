@@ -466,9 +466,21 @@ pub struct TermWindow {
     gl: Option<Rc<glium::backend::Context>>,
     webgpu: Option<Rc<WebGpuState>>,
     post_process: Option<PostProcessState>,
+    post_process_fingerprint: Option<PostProcessFingerprint>,
     last_post_process_time: Option<Instant>,
     post_process_frame: u32,
     config_subscription: Option<config::ConfigSubscription>,
+}
+
+/// Captures the inputs that feed into `PostProcessState` construction so we
+/// can skip rebuilding the pipeline (and losing burn-in accumulation) when a
+/// config reload didn't actually change anything shader-related.
+#[derive(PartialEq)]
+struct PostProcessFingerprint {
+    paths: Vec<std::path::PathBuf>,
+    mtimes: Vec<Option<std::time::SystemTime>>,
+    burn_in: bool,
+    bloom: bool,
 }
 
 impl TermWindow {
@@ -695,6 +707,7 @@ impl TermWindow {
             gl: None,
             webgpu: None,
             post_process: None,
+            post_process_fingerprint: None,
             last_post_process_time: None,
             post_process_frame: 0,
             window: None,
@@ -1862,9 +1875,29 @@ impl TermWindow {
             if self.post_process.is_some() {
                 log::info!("postprocess: custom_shaders cleared, removing post-process pipeline");
                 self.post_process = None;
+                self.post_process_fingerprint = None;
                 self.last_post_process_time = None;
                 self.post_process_frame = 0;
             }
+            return;
+        }
+
+        // config_was_reloaded can fire for reasons unrelated to shaders
+        // (e.g. system appearance changes). Avoid tearing down the
+        // pipeline (which resets burn-in accumulation and recompiles all
+        // shaders) unless something relevant actually changed.
+        let fingerprint = PostProcessFingerprint {
+            paths: shader_paths.clone(),
+            mtimes: shader_paths
+                .iter()
+                .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+                .collect(),
+            burn_in: self.config.custom_shader_burn_in > 0.0,
+            bloom: self.config.custom_shader_bloom,
+        };
+        if self.post_process.is_some()
+            && self.post_process_fingerprint.as_ref() == Some(&fingerprint)
+        {
             return;
         }
 
@@ -1889,16 +1922,14 @@ impl TermWindow {
         let height = config.height;
         drop(config);
 
-        let burn_in = self.config.custom_shader_burn_in > 0.0;
-        let bloom = self.config.custom_shader_bloom;
         match PostProcessState::new(
             &webgpu.device,
             format,
             width,
             height,
             shader_paths,
-            burn_in,
-            bloom,
+            fingerprint.burn_in,
+            fingerprint.bloom,
         ) {
             Some(state) => {
                 log::info!(
@@ -1906,6 +1937,7 @@ impl TermWindow {
                     state.pipelines.len()
                 );
                 self.post_process = Some(state);
+                self.post_process_fingerprint = Some(fingerprint);
                 self.last_post_process_time = None;
                 self.post_process_frame = 0;
             }
@@ -1914,6 +1946,7 @@ impl TermWindow {
                     "postprocess: failed to create post-process state, falling back to no shaders"
                 );
                 self.post_process = None;
+                self.post_process_fingerprint = None;
                 self.last_post_process_time = None;
                 self.post_process_frame = 0;
             }
