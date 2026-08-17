@@ -1889,7 +1889,17 @@ impl TermWindow {
         let height = config.height;
         drop(config);
 
-        match PostProcessState::new(&webgpu.device, format, width, height, shader_paths) {
+        let burn_in = self.config.custom_shader_burn_in > 0.0;
+        let bloom = self.config.custom_shader_bloom;
+        match PostProcessState::new(
+            &webgpu.device,
+            format,
+            width,
+            height,
+            shader_paths,
+            burn_in,
+            bloom,
+        ) {
             Some(state) => {
                 log::info!(
                     "postprocess: initialized with {} pipeline(s)",

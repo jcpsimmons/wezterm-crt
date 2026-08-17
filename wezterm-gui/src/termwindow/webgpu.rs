@@ -29,7 +29,9 @@ pub struct PostProcessUniform {
     pub time: f32,
     pub time_delta: f32,
     pub frame: u32,
-    pub _padding: [u32; 3],
+    /// Burn-in decay rate (1/seconds). 0 when burn-in is disabled.
+    pub burn_in_time: f32,
+    pub _padding: [u32; 2],
 }
 
 /// State for the post-processing shader pipeline.
@@ -41,8 +43,11 @@ pub struct PostProcessState {
     pub sampler: wgpu::Sampler,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub _uniform_bind_group_layout: wgpu::BindGroupLayout,
-    pub bind_group_intermediate: wgpu::BindGroup,
-    pub bind_group_pingpong: Option<wgpu::BindGroup>,
+    /// Bind groups for user passes reading the intermediate texture,
+    /// indexed by burn-in parity (which burn-in texture is "current").
+    /// When burn-in is disabled both entries are identical.
+    pub bind_group_intermediate: [wgpu::BindGroup; 2],
+    pub bind_group_pingpong: Option<[wgpu::BindGroup; 2]>,
     pub uniform_buffer: wgpu::Buffer,
     pub uniform_bind_group: wgpu::BindGroup,
     pub pipelines: Vec<wgpu::RenderPipeline>,
@@ -51,6 +56,31 @@ pub struct PostProcessState {
     /// The surface format used when these resources were created,
     /// so we can detect if it changes on resize.
     pub format: wgpu::TextureFormat,
+
+    /// Burn-in accumulation: a pair of persistent textures ping-ponged
+    /// across frames. Each frame the accumulation pass reads the previous
+    /// accumulation + the freshly rendered terminal and writes the new
+    /// accumulation, which user shaders sample via `burnin_texture`.
+    pub burnin_pipeline: Option<wgpu::RenderPipeline>,
+    pub burnin_textures: Option<[wgpu::Texture; 2]>,
+    pub burnin_views: Option<[wgpu::TextureView; 2]>,
+    /// Bind groups for the accumulation pass, indexed by which burn-in
+    /// texture holds the *previous* accumulation.
+    pub burnin_accum_bind_groups: Option<[wgpu::BindGroup; 2]>,
+
+    /// Bloom: a quarter-resolution blurred copy of the terminal, produced
+    /// by separable gaussian blur passes. User shaders sample the final
+    /// result via `bloom_texture`.
+    pub bloom_pipelines: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
+    pub bloom_textures: Option<(wgpu::Texture, wgpu::Texture)>,
+    pub bloom_views: Option<(wgpu::TextureView, wgpu::TextureView)>,
+    /// Bind group for the vertical blur pass (reads the horizontal result).
+    pub bloom_h_bind_group: Option<wgpu::BindGroup>,
+
+    /// 1x1 black texture bound in place of burn-in/bloom textures when
+    /// those features are disabled.
+    pub _dummy_texture: wgpu::Texture,
+    pub dummy_view: wgpu::TextureView,
 }
 
 /// The preamble from postprocess.wgsl minus the default fs_postprocess function.
@@ -61,9 +91,9 @@ struct PostProcessUniform {
     time: f32,
     time_delta: f32,
     frame: u32,
+    burn_in_time: f32,
     _padding_0: u32,
     _padding_1: u32,
-    _padding_2: u32,
 };
 
 struct VertexOutput {
@@ -73,6 +103,8 @@ struct VertexOutput {
 
 @group(0) @binding(0) var screen_texture: texture_2d<f32>;
 @group(0) @binding(1) var screen_sampler: sampler;
+@group(0) @binding(2) var burnin_texture: texture_2d<f32>;
+@group(0) @binding(3) var bloom_texture: texture_2d<f32>;
 
 @group(1) @binding(0) var<uniform> pp: PostProcessUniform;
 
@@ -86,6 +118,71 @@ fn vs_postprocess(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+";
+
+/// Built-in burn-in accumulation pass, modelled on cool-retro-term's
+/// burn_in.frag. Reads the freshly rendered terminal (screen_texture)
+/// and the previous accumulation (burnin_texture), and outputs the new
+/// accumulation: previous decayed toward black, then max()ed with the
+/// current frame. The alpha channel stores a mask of pixels that are
+/// currently lit, so shaders can avoid double-brightening live pixels.
+const BURNIN_ACCUM_SHADER: &str = "\
+fn rgb2grey(v: vec3<f32>) -> f32 {
+    return dot(v, vec3<f32>(0.21, 0.72, 0.04));
+}
+
+@fragment
+fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
+    let txt_color = textureSample(screen_texture, screen_sampler, in.uv).rgb;
+    let acc_color = textureSample(burnin_texture, screen_sampler, in.uv);
+
+    let prev_mask = acc_color.a;
+    var blur_decay = clamp(pp.time_delta * pp.burn_in_time, 0.0, 1.0);
+    blur_decay = max(0.0, blur_decay - prev_mask);
+    let color = max(acc_color.rgb - vec3<f32>(blur_decay), txt_color);
+
+    let curr_mask = step(rgb2grey(color), rgb2grey(txt_color));
+
+    return vec4<f32>(color, curr_mask);
+}
+";
+
+/// Built-in separable gaussian blur used to produce the bloom texture.
+/// The horizontal pass reads the full resolution terminal render and
+/// writes to a quarter resolution target; the vertical pass completes
+/// the blur at quarter resolution.
+const BLOOM_BLUR_H_SHADER: &str = "\
+@fragment
+fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(screen_texture));
+    let texel = 1.0 / dims;
+    // 13-tap gaussian, sigma ~4 texels at the *output* (quarter) resolution;
+    // sample spacing is 4 source texels because we're downsampling 4x.
+    let weights = array<f32, 7>(0.1964, 0.1743, 0.1216, 0.0667, 0.0287, 0.0097, 0.0026);
+    var sum = textureSample(screen_texture, screen_sampler, in.uv) * weights[0];
+    for (var i = 1; i < 7; i = i + 1) {
+        let offset = vec2<f32>(f32(i) * 4.0 * texel.x, 0.0);
+        sum += textureSample(screen_texture, screen_sampler, in.uv + offset) * weights[i];
+        sum += textureSample(screen_texture, screen_sampler, in.uv - offset) * weights[i];
+    }
+    return vec4<f32>(sum.rgb, 1.0);
+}
+";
+
+const BLOOM_BLUR_V_SHADER: &str = "\
+@fragment
+fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(screen_texture));
+    let texel = 1.0 / dims;
+    let weights = array<f32, 7>(0.1964, 0.1743, 0.1216, 0.0667, 0.0287, 0.0097, 0.0026);
+    var sum = textureSample(screen_texture, screen_sampler, in.uv) * weights[0];
+    for (var i = 1; i < 7; i = i + 1) {
+        let offset = vec2<f32>(0.0, f32(i) * texel.y);
+        sum += textureSample(screen_texture, screen_sampler, in.uv + offset) * weights[i];
+        sum += textureSample(screen_texture, screen_sampler, in.uv - offset) * weights[i];
+    }
+    return vec4<f32>(sum.rgb, 1.0);
+}
 ";
 
 /// Strip BOM, decode UTF-8, validate non-empty, and prepend the standard
@@ -157,29 +254,45 @@ fn compile_postprocess_shader(
     };
 
     let full_source = prepare_shader_source(&raw_source, path)?;
+    compile_postprocess_source(
+        device,
+        &path.display().to_string(),
+        &full_source,
+        format,
+        texture_bind_group_layout,
+        uniform_bind_group_layout,
+    )
+}
 
+/// Compile a post-process pipeline from a complete WGSL source string
+/// (preamble already included). Used both for user shader files and the
+/// built-in burn-in / bloom passes.
+fn compile_postprocess_source(
+    device: &wgpu::Device,
+    label: &str,
+    full_source: &str,
+    format: wgpu::TextureFormat,
+    texture_bind_group_layout: &wgpu::BindGroupLayout,
+    uniform_bind_group_layout: &wgpu::BindGroupLayout,
+) -> Option<wgpu::RenderPipeline> {
     // Use error scopes to catch validation errors without crashing
     device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(&format!("PostProcess Shader: {}", path.display())),
+        label: Some(&format!("PostProcess Shader: {label}")),
         source: wgpu::ShaderSource::Wgsl(full_source.into()),
     });
 
     // Poll for validation errors from shader compilation
     let shader_error = smol::block_on(device.pop_error_scope());
     if let Some(err) = shader_error {
-        log::error!(
-            "postprocess: shader compilation failed for {}: {:#}",
-            path.display(),
-            err
-        );
+        log::error!("postprocess: shader compilation failed for {label}: {err:#}");
         return None;
     }
 
-    // Build the pipeline layout: group 0 = texture+sampler, group 1 = uniform
+    // Build the pipeline layout: group 0 = textures+sampler, group 1 = uniform
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&format!("PostProcess Pipeline Layout: {}", path.display())),
+        label: Some(&format!("PostProcess Pipeline Layout: {label}")),
         bind_group_layouts: &[texture_bind_group_layout, uniform_bind_group_layout],
         push_constant_ranges: &[],
     });
@@ -187,7 +300,7 @@ fn compile_postprocess_shader(
     device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(&format!("PostProcess Pipeline: {}", path.display())),
+        label: Some(&format!("PostProcess Pipeline: {label}")),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader_module,
@@ -226,19 +339,225 @@ fn compile_postprocess_shader(
 
     let pipeline_error = smol::block_on(device.pop_error_scope());
     if let Some(err) = pipeline_error {
-        log::error!(
-            "postprocess: render pipeline creation failed for {}: {:#}",
-            path.display(),
-            err
-        );
+        log::error!("postprocess: render pipeline creation failed for {label}: {err:#}");
         return None;
     }
 
-    log::info!(
-        "postprocess: successfully compiled shader {}",
-        path.display()
-    );
+    log::info!("postprocess: successfully compiled shader {label}");
     Some(pipeline)
+}
+
+/// Create a render-attachment + texture-binding texture of the given size.
+fn create_pp_texture(
+    device: &wgpu::Device,
+    label: &str,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Create a bind group for the post-process texture layout:
+/// binding 0 = source texture, 1 = sampler, 2 = burn-in, 3 = bloom.
+fn create_pp_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    label: &str,
+    source: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    burnin: &wgpu::TextureView,
+    bloom: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(burnin),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(bloom),
+            },
+        ],
+        label: Some(label),
+    })
+}
+
+/// The size-dependent textures and bind groups for the post-process
+/// pipeline. Rebuilt wholesale on resize.
+struct PpTextures {
+    intermediate_texture: wgpu::Texture,
+    intermediate_view: wgpu::TextureView,
+    bind_group_intermediate: [wgpu::BindGroup; 2],
+    ping_pong_texture: Option<wgpu::Texture>,
+    ping_pong_view: Option<wgpu::TextureView>,
+    bind_group_pingpong: Option<[wgpu::BindGroup; 2]>,
+    burnin_textures: Option<[wgpu::Texture; 2]>,
+    burnin_views: Option<[wgpu::TextureView; 2]>,
+    burnin_accum_bind_groups: Option<[wgpu::BindGroup; 2]>,
+    bloom_textures: Option<(wgpu::Texture, wgpu::Texture)>,
+    bloom_views: Option<(wgpu::TextureView, wgpu::TextureView)>,
+    bloom_h_bind_group: Option<wgpu::BindGroup>,
+}
+
+fn build_pp_textures(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    dummy_view: &wgpu::TextureView,
+    multi_pass: bool,
+    burnin: bool,
+    bloom: bool,
+) -> PpTextures {
+    let (intermediate_texture, intermediate_view) = create_pp_texture(
+        device,
+        "PostProcess Intermediate Texture",
+        format,
+        width,
+        height,
+    );
+
+    let (burnin_textures, burnin_views) = if burnin {
+        let (t0, v0) =
+            create_pp_texture(device, "PostProcess BurnIn Texture 0", format, width, height);
+        let (t1, v1) =
+            create_pp_texture(device, "PostProcess BurnIn Texture 1", format, width, height);
+        (Some([t0, t1]), Some([v0, v1]))
+    } else {
+        (None, None)
+    };
+
+    let (bloom_textures, bloom_views) = if bloom {
+        let bw = (width / 4).max(1);
+        let bh = (height / 4).max(1);
+        let (th, vh) = create_pp_texture(device, "PostProcess Bloom H Texture", format, bw, bh);
+        let (tv, vv) = create_pp_texture(device, "PostProcess Bloom V Texture", format, bw, bh);
+        (Some((th, tv)), Some((vh, vv)))
+    } else {
+        (None, None)
+    };
+
+    // The burn-in texture that user passes sample, per parity.
+    // When burn-in is disabled both parities use the dummy.
+    let burnin_for = |parity: usize| -> &wgpu::TextureView {
+        match &burnin_views {
+            Some(views) => &views[parity],
+            None => dummy_view,
+        }
+    };
+    let bloom_final = match &bloom_views {
+        Some((_h, v)) => v,
+        None => dummy_view,
+    };
+
+    let bind_group_intermediate = [0usize, 1].map(|parity| {
+        create_pp_bind_group(
+            device,
+            layout,
+            "PostProcess Intermediate Bind Group",
+            &intermediate_view,
+            sampler,
+            burnin_for(parity),
+            bloom_final,
+        )
+    });
+
+    let (ping_pong_texture, ping_pong_view, bind_group_pingpong) = if multi_pass {
+        let (pp_texture, pp_view) = create_pp_texture(
+            device,
+            "PostProcess Ping-Pong Texture",
+            format,
+            width,
+            height,
+        );
+        let bind_groups = [0usize, 1].map(|parity| {
+            create_pp_bind_group(
+                device,
+                layout,
+                "PostProcess Ping-Pong Bind Group",
+                &pp_view,
+                sampler,
+                burnin_for(parity),
+                bloom_final,
+            )
+        });
+        (Some(pp_texture), Some(pp_view), Some(bind_groups))
+    } else {
+        (None, None, None)
+    };
+
+    // Accumulation pass bind groups: read intermediate as source and the
+    // *previous* accumulation via the burn-in binding, indexed by which
+    // texture holds the previous accumulation.
+    let burnin_accum_bind_groups = burnin_views.as_ref().map(|views| {
+        [0usize, 1].map(|prev| {
+            create_pp_bind_group(
+                device,
+                layout,
+                "PostProcess BurnIn Accum Bind Group",
+                &intermediate_view,
+                sampler,
+                &views[prev],
+                dummy_view,
+            )
+        })
+    });
+
+    // Vertical blur reads the horizontal blur result as its source.
+    let bloom_h_bind_group = bloom_views.as_ref().map(|(h, _v)| {
+        create_pp_bind_group(
+            device,
+            layout,
+            "PostProcess Bloom V Bind Group",
+            h,
+            sampler,
+            dummy_view,
+            dummy_view,
+        )
+    });
+
+    PpTextures {
+        intermediate_texture,
+        intermediate_view,
+        bind_group_intermediate,
+        ping_pong_texture,
+        ping_pong_view,
+        bind_group_pingpong,
+        burnin_textures,
+        burnin_views,
+        burnin_accum_bind_groups,
+        bloom_textures,
+        bloom_views,
+        bloom_h_bind_group,
+    }
 }
 
 impl PostProcessState {
@@ -251,6 +570,8 @@ impl PostProcessState {
         width: u32,
         height: u32,
         shader_paths: &[std::path::PathBuf],
+        burn_in: bool,
+        bloom: bool,
     ) -> Option<Self> {
         if width == 0 || height == 0 {
             log::warn!("postprocess: skipping creation with zero dimensions");
@@ -279,6 +600,26 @@ impl PostProcessState {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
                         count: None,
                     },
                 ],
@@ -328,24 +669,54 @@ impl PostProcessState {
             shader_paths.len()
         );
 
-        // Create intermediate texture — same format as surface
-        let intermediate_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("PostProcess Intermediate Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let intermediate_view =
-            intermediate_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Compile built-in burn-in / bloom pipelines as requested.
+        let burnin_pipeline = if burn_in {
+            let source = format!("{}{}", POSTPROCESS_PREAMBLE, BURNIN_ACCUM_SHADER);
+            let pipeline = compile_postprocess_source(
+                device,
+                "builtin burn-in accumulation",
+                &source,
+                format,
+                &texture_bind_group_layout,
+                &uniform_bind_group_layout,
+            );
+            if pipeline.is_none() {
+                log::error!("postprocess: built-in burn-in shader failed to compile; disabled");
+            }
+            pipeline
+        } else {
+            None
+        };
+
+        let bloom_pipelines = if bloom {
+            let h_source = format!("{}{}", POSTPROCESS_PREAMBLE, BLOOM_BLUR_H_SHADER);
+            let v_source = format!("{}{}", POSTPROCESS_PREAMBLE, BLOOM_BLUR_V_SHADER);
+            let h = compile_postprocess_source(
+                device,
+                "builtin bloom blur (horizontal)",
+                &h_source,
+                format,
+                &texture_bind_group_layout,
+                &uniform_bind_group_layout,
+            );
+            let v = compile_postprocess_source(
+                device,
+                "builtin bloom blur (vertical)",
+                &v_source,
+                format,
+                &texture_bind_group_layout,
+                &uniform_bind_group_layout,
+            );
+            match (h, v) {
+                (Some(h), Some(v)) => Some((h, v)),
+                _ => {
+                    log::error!("postprocess: built-in bloom shaders failed to compile; disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Sampler for reading intermediate/ping-pong textures
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -358,13 +729,16 @@ impl PostProcessState {
             ..Default::default()
         });
 
+        // 1x1 black dummy bound in place of disabled burn-in/bloom textures
+        let (dummy_texture, dummy_view) =
+            create_pp_texture(device, "PostProcess Dummy Texture", format, 1, 1);
+
         // Uniform buffer
-        let uniform_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("PostProcess Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[PostProcessUniform::default()]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("PostProcess Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[PostProcessUniform::default()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &uniform_bind_group_layout,
@@ -375,78 +749,43 @@ impl PostProcessState {
             label: Some("PostProcess Uniform Bind Group"),
         });
 
-        // Pre-create bind group for reading the intermediate texture
-        let bind_group_intermediate =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&intermediate_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-                label: Some("PostProcess Intermediate Bind Group"),
-            });
-
-        // Ping-pong texture only needed when >1 shader in the chain
-        let (ping_pong_texture, ping_pong_view, bind_group_pingpong) = if pipelines.len() > 1 {
-            let pp_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("PostProcess Ping-Pong Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let pp_view =
-                pp_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            let pp_bind_group =
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    layout: &texture_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&pp_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&sampler),
-                        },
-                    ],
-                    label: Some("PostProcess Ping-Pong Bind Group"),
-                });
-
-            (Some(pp_texture), Some(pp_view), Some(pp_bind_group))
-        } else {
-            (None, None, None)
-        };
+        let textures = build_pp_textures(
+            device,
+            format,
+            width,
+            height,
+            &texture_bind_group_layout,
+            &sampler,
+            &dummy_view,
+            pipelines.len() > 1,
+            burnin_pipeline.is_some(),
+            bloom_pipelines.is_some(),
+        );
 
         Some(PostProcessState {
-            intermediate_texture,
-            intermediate_view,
+            intermediate_texture: textures.intermediate_texture,
+            intermediate_view: textures.intermediate_view,
             sampler,
             bind_group_layout: texture_bind_group_layout,
             _uniform_bind_group_layout: uniform_bind_group_layout,
-            bind_group_intermediate,
-            bind_group_pingpong,
+            bind_group_intermediate: textures.bind_group_intermediate,
+            bind_group_pingpong: textures.bind_group_pingpong,
             uniform_buffer,
             uniform_bind_group,
             pipelines,
-            ping_pong_texture,
-            ping_pong_view,
+            ping_pong_texture: textures.ping_pong_texture,
+            ping_pong_view: textures.ping_pong_view,
             format,
+            burnin_pipeline,
+            burnin_textures: textures.burnin_textures,
+            burnin_views: textures.burnin_views,
+            burnin_accum_bind_groups: textures.burnin_accum_bind_groups,
+            bloom_pipelines,
+            bloom_textures: textures.bloom_textures,
+            bloom_views: textures.bloom_views,
+            bloom_h_bind_group: textures.bloom_h_bind_group,
+            _dummy_texture: dummy_texture,
+            dummy_view,
         })
     }
 
@@ -459,84 +798,31 @@ impl PostProcessState {
             return false;
         }
 
-        let format = self.format;
+        let textures = build_pp_textures(
+            device,
+            self.format,
+            width,
+            height,
+            &self.bind_group_layout,
+            &self.sampler,
+            &self.dummy_view,
+            self.ping_pong_texture.is_some(),
+            self.burnin_pipeline.is_some(),
+            self.bloom_pipelines.is_some(),
+        );
 
-        // Recreate intermediate texture
-        self.intermediate_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("PostProcess Intermediate Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        self.intermediate_view = self
-            .intermediate_texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Recreate bind group for intermediate
-        self.bind_group_intermediate =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.intermediate_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-                label: Some("PostProcess Intermediate Bind Group"),
-            });
-
-        // Recreate ping-pong if present
-        if self.ping_pong_texture.is_some() {
-            let pp_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("PostProcess Ping-Pong Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let pp_view =
-                pp_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            self.bind_group_pingpong =
-                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    layout: &self.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&pp_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                    label: Some("PostProcess Ping-Pong Bind Group"),
-                }));
-
-            self.ping_pong_texture = Some(pp_texture);
-            self.ping_pong_view = Some(pp_view);
-        }
+        self.intermediate_texture = textures.intermediate_texture;
+        self.intermediate_view = textures.intermediate_view;
+        self.bind_group_intermediate = textures.bind_group_intermediate;
+        self.ping_pong_texture = textures.ping_pong_texture;
+        self.ping_pong_view = textures.ping_pong_view;
+        self.bind_group_pingpong = textures.bind_group_pingpong;
+        self.burnin_textures = textures.burnin_textures;
+        self.burnin_views = textures.burnin_views;
+        self.burnin_accum_bind_groups = textures.burnin_accum_bind_groups;
+        self.bloom_textures = textures.bloom_textures;
+        self.bloom_views = textures.bloom_views;
+        self.bloom_h_bind_group = textures.bloom_h_bind_group;
 
         true
     }
@@ -1113,6 +1399,35 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     #[test]
+    fn test_builtin_shaders_are_valid_wgsl() {
+        for (name, body) in [
+            ("burnin", BURNIN_ACCUM_SHADER),
+            ("bloom_h", BLOOM_BLUR_H_SHADER),
+            ("bloom_v", BLOOM_BLUR_V_SHADER),
+        ] {
+            let source = format!("{}{}", POSTPROCESS_PREAMBLE, body);
+            let result = naga::front::wgsl::parse_str(&source);
+            assert!(
+                result.is_ok(),
+                "Built-in shader {name} must parse: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_crt_shader_is_valid_wgsl() {
+        let body = include_str!("../../../assets/shaders/crt.wgsl");
+        let source = format!("{}{}", POSTPROCESS_PREAMBLE, body);
+        let result = naga::front::wgsl::parse_str(&source);
+        assert!(
+            result.is_ok(),
+            "CRT shader must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
     fn test_prepare_shader_source_valid() {
         let body = b"@fragment\nfn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {\n    return vec4<f32>(1.0);\n}\n";
         let result = prepare_shader_source(body, &PathBuf::from("test.wgsl"));
@@ -1167,6 +1482,26 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
                     count: None,
                 },
             ],
@@ -1340,7 +1675,7 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
         .unwrap();
 
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let state = PostProcessState::new(&device, format, 800, 600, &[shader_path]);
+        let state = PostProcessState::new(&device, format, 800, 600, &[shader_path], false, false);
         assert!(state.is_some(), "Single valid shader should create state");
         let state = state.unwrap();
         assert_eq!(state.pipelines.len(), 1);
@@ -1367,7 +1702,7 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
         std::fs::write(&path2, shader_body).unwrap();
 
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let state = PostProcessState::new(&device, format, 800, 600, &[path1, path2]);
+        let state = PostProcessState::new(&device, format, 800, 600, &[path1, path2], false, false);
         assert!(state.is_some(), "Two valid shaders should create state");
         let state = state.unwrap();
         assert_eq!(state.pipelines.len(), 2);
@@ -1390,8 +1725,8 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
         .unwrap();
 
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        assert!(PostProcessState::new(&device, format, 0, 600, &[shader_path.clone()]).is_none());
-        assert!(PostProcessState::new(&device, format, 800, 0, &[shader_path]).is_none());
+        assert!(PostProcessState::new(&device, format, 0, 600, &[shader_path.clone()], false, false).is_none());
+        assert!(PostProcessState::new(&device, format, 800, 0, &[shader_path], false, false).is_none());
     }
 
     #[test]
@@ -1408,6 +1743,8 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
             800,
             600,
             &[PathBuf::from("/no/such/a.wgsl"), PathBuf::from("/no/such/b.wgsl")],
+            false,
+            false,
         );
         assert!(result.is_none(), "No valid shaders should return None");
     }
@@ -1439,9 +1776,51 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
             800,
             600,
             &[valid_path, PathBuf::from("/no/such/bad.wgsl")],
+            false,
+            false,
         );
         assert!(state.is_some(), "Mixed valid/invalid should still create state");
         assert_eq!(state.unwrap().pipelines.len(), 1);
+    }
+
+    #[test]
+    fn test_postprocess_state_burnin_bloom() {
+        let Some((device, _queue)) = create_test_device() else {
+            eprintln!("Skipping test_postprocess_state_burnin_bloom: no GPU adapter available");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let shader_path = dir.path().join("crtish.wgsl");
+        std::fs::write(
+            &shader_path,
+            r#"
+@fragment
+fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
+    let src = textureSample(screen_texture, screen_sampler, in.uv);
+    let burn = textureSample(burnin_texture, screen_sampler, in.uv);
+    let bloom = textureSample(bloom_texture, screen_sampler, in.uv);
+    return vec4<f32>(max(src.rgb, burn.rgb * 0.65) + bloom.rgb * 0.3, 1.0);
+}
+"#,
+        )
+        .unwrap();
+
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let state = PostProcessState::new(&device, format, 800, 600, &[shader_path], true, true);
+        assert!(state.is_some(), "burn-in + bloom state should be created");
+        let mut state = state.unwrap();
+        assert!(state.burnin_pipeline.is_some());
+        assert!(state.burnin_textures.is_some());
+        assert!(state.burnin_accum_bind_groups.is_some());
+        assert!(state.bloom_pipelines.is_some());
+        assert!(state.bloom_textures.is_some());
+        assert!(state.bloom_h_bind_group.is_some());
+
+        // resize must preserve the burn-in/bloom resources
+        assert!(state.resize(&device, 1024, 768));
+        assert!(state.burnin_textures.is_some());
+        assert!(state.bloom_textures.is_some());
     }
 
     #[test]
@@ -1465,7 +1844,7 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
         .unwrap();
 
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let mut state = PostProcessState::new(&device, format, 800, 600, &[shader_path]).unwrap();
+        let mut state = PostProcessState::new(&device, format, 800, 600, &[shader_path], false, false).unwrap();
 
         assert!(state.resize(&device, 1024, 768), "Resize to valid dims should return true");
         assert!(!state.resize(&device, 0, 768), "Resize to zero width should return false");
@@ -1560,6 +1939,10 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
             ..Default::default()
         });
 
+        // --- Dummy texture for the burn-in/bloom bindings ---
+        let (_dummy_texture, dummy_view) =
+            create_pp_texture(&device, "Test dummy texture", format, 1, 1);
+
         // --- Texture bind group (group 0) ---
         let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Test texture bind group"),
@@ -1572,6 +1955,14 @@ fn fs_postprocess(in: VertexOutput) -> @location(0) vec4<f32> {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&dummy_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&dummy_view),
                 },
             ],
         });

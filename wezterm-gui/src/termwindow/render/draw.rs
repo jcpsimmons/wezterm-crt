@@ -196,6 +196,16 @@ impl crate::TermWindow {
             self.last_post_process_time = Some(now);
             self.post_process_frame = self.post_process_frame.wrapping_add(1);
 
+            // Burn-in decay rate, modelled on cool-retro-term: the fade
+            // time ranges from 0.16s (weakest) to 1.6s (strongest) and the
+            // shader uses its reciprocal.
+            let burn_in = self.config.custom_shader_burn_in.clamp(0.0, 1.0);
+            let burn_in_time = if burn_in > 0.0 {
+                1.0 / (0.16 + (1.6 - 0.16) * burn_in)
+            } else {
+                0.0
+            };
+
             let uniform = PostProcessUniform {
                 resolution: [
                     self.dimensions.pixel_width as f32,
@@ -204,40 +214,26 @@ impl crate::TermWindow {
                 time,
                 time_delta,
                 frame: self.post_process_frame,
-                _padding: [0; 3],
+                burn_in_time,
+                _padding: [0; 2],
             };
             webgpu
                 .queue
                 .write_buffer(&pp.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
 
-            let num_pipelines = pp.pipelines.len();
+            // Which of the two persistent burn-in textures is "current"
+            // this frame; alternates every frame.
+            let parity = (self.post_process_frame & 1) as usize;
 
-            for (i, pipeline) in pp.pipelines.iter().enumerate() {
-                // Determine which texture to read from and which to write to.
-                // Pattern for N shaders:
-                //   shader 0: read intermediate, write to pingpong (or surface if N==1)
-                //   shader 1: read pingpong, write to intermediate (or surface if last)
-                //   shader 2: read intermediate, write to pingpong (or surface if last)
-                //   ...
-                // Even-indexed shaders read from intermediate, odd from pingpong.
-                // The last shader always writes to the surface.
-                let (read_src, write_dst) = ping_pong_targets(i, num_pipelines);
-
-                let read_bind_group = match read_src {
-                    ReadSource::Intermediate => &pp.bind_group_intermediate,
-                    ReadSource::PingPong => pp.bind_group_pingpong.as_ref().unwrap(),
-                };
-
-                let write_view = match write_dst {
-                    WriteTarget::Surface => &surface_view,
-                    WriteTarget::PingPong => pp.ping_pong_view.as_ref().unwrap(),
-                    WriteTarget::Intermediate => &pp.intermediate_view,
-                };
-
+            let run_fullscreen_pass = |encoder: &mut wgpu::CommandEncoder,
+                                       label: &str,
+                                       pipeline: &wgpu::RenderPipeline,
+                                       bind_group: &wgpu::BindGroup,
+                                       target: &wgpu::TextureView| {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("PostProcess Pass"),
+                    label: Some(label),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: write_view,
+                        view: target,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -255,9 +251,80 @@ impl crate::TermWindow {
                 });
 
                 render_pass.set_pipeline(pipeline);
-                render_pass.set_bind_group(0, read_bind_group, &[]);
+                render_pass.set_bind_group(0, bind_group, &[]);
                 render_pass.set_bind_group(1, &pp.uniform_bind_group, &[]);
                 render_pass.draw(0..3, 0..1);
+            };
+
+            // Built-in burn-in accumulation: read the previous accumulation
+            // and the freshly rendered terminal, write the new accumulation.
+            if let (Some(pipeline), Some(accum_bind_groups), Some(views)) = (
+                &pp.burnin_pipeline,
+                &pp.burnin_accum_bind_groups,
+                &pp.burnin_views,
+            ) {
+                let prev = parity ^ 1;
+                run_fullscreen_pass(
+                    &mut encoder,
+                    "PostProcess BurnIn Accum Pass",
+                    pipeline,
+                    &accum_bind_groups[prev],
+                    &views[parity],
+                );
+            }
+
+            // Built-in bloom: separable gaussian blur into a quarter-res
+            // texture that user shaders sample via `bloom_texture`.
+            if let (Some((h_pipeline, v_pipeline)), Some((h_view, v_view))) =
+                (&pp.bloom_pipelines, &pp.bloom_views)
+            {
+                run_fullscreen_pass(
+                    &mut encoder,
+                    "PostProcess Bloom H Pass",
+                    h_pipeline,
+                    &pp.bind_group_intermediate[parity],
+                    h_view,
+                );
+                run_fullscreen_pass(
+                    &mut encoder,
+                    "PostProcess Bloom V Pass",
+                    v_pipeline,
+                    pp.bloom_h_bind_group.as_ref().unwrap(),
+                    v_view,
+                );
+            }
+
+            let num_pipelines = pp.pipelines.len();
+
+            for (i, pipeline) in pp.pipelines.iter().enumerate() {
+                // Determine which texture to read from and which to write to.
+                // Pattern for N shaders:
+                //   shader 0: read intermediate, write to pingpong (or surface if N==1)
+                //   shader 1: read pingpong, write to intermediate (or surface if last)
+                //   shader 2: read intermediate, write to pingpong (or surface if last)
+                //   ...
+                // Even-indexed shaders read from intermediate, odd from pingpong.
+                // The last shader always writes to the surface.
+                let (read_src, write_dst) = ping_pong_targets(i, num_pipelines);
+
+                let read_bind_group = match read_src {
+                    ReadSource::Intermediate => &pp.bind_group_intermediate[parity],
+                    ReadSource::PingPong => &pp.bind_group_pingpong.as_ref().unwrap()[parity],
+                };
+
+                let write_view = match write_dst {
+                    WriteTarget::Surface => &surface_view,
+                    WriteTarget::PingPong => pp.ping_pong_view.as_ref().unwrap(),
+                    WriteTarget::Intermediate => &pp.intermediate_view,
+                };
+
+                run_fullscreen_pass(
+                    &mut encoder,
+                    "PostProcess Pass",
+                    pipeline,
+                    read_bind_group,
+                    write_view,
+                );
             }
         }
 

@@ -11,9 +11,9 @@ struct PostProcessUniform {
     time: f32,
     time_delta: f32,
     frame: u32,
+    burn_in_time: f32,
     _padding_0: u32,
     _padding_1: u32,
-    _padding_2: u32,
 };
 
 struct VertexOutput {
@@ -23,6 +23,8 @@ struct VertexOutput {
 
 @group(0) @binding(0) var screen_texture: texture_2d<f32>;
 @group(0) @binding(1) var screen_sampler: sampler;
+@group(0) @binding(2) var burnin_texture: texture_2d<f32>;
+@group(0) @binding(3) var bloom_texture: texture_2d<f32>;
 
 @group(1) @binding(0) var<uniform> pp: PostProcessUniform;
 

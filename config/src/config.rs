@@ -572,6 +572,25 @@ pub struct Config {
     #[dynamic(default)]
     pub custom_shaders: Vec<PathBuf>,
 
+    /// Burn-in (phosphor persistence) intensity for custom shaders, in the
+    /// range 0.0 (disabled) to 1.0 (longest trails). When non-zero, the
+    /// post-processing pipeline maintains a persistent accumulation texture
+    /// that custom shaders can sample via `burnin_texture`.
+    #[dynamic(default)]
+    pub custom_shader_burn_in: f32,
+
+    /// When true, the post-processing pipeline renders a downsampled,
+    /// gaussian-blurred copy of the terminal that custom shaders can sample
+    /// via `bloom_texture` for true bloom effects.
+    #[dynamic(default)]
+    pub custom_shader_bloom: bool,
+
+    /// Frame rate cap used to schedule repaints while animated custom
+    /// shaders are active. Set to 0 to disable continuous repaints
+    /// (appropriate for purely static shaders).
+    #[dynamic(default = "default_custom_shader_fps")]
+    pub custom_shader_fps: u8,
+
     /// Only works on MacOS
     #[dynamic(default)]
     pub macos_window_background_blur: i64,
@@ -2214,6 +2233,10 @@ pub(crate) fn validate_domain_name(name: &str) -> Result<(), String> {
 /// <https://github.com/wezterm/wezterm/issues/2630>
 fn default_macos_forward_mods() -> Modifiers {
     Modifiers::SHIFT
+}
+
+fn default_custom_shader_fps() -> u8 {
+    60
 }
 
 fn default_colr_rasterizer() -> FontRasterizerSelection {

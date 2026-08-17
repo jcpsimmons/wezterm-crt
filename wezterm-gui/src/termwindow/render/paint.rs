@@ -116,10 +116,13 @@ impl crate::TermWindow {
         metrics::histogram!("gui.paint.impl.rate").record(1.);
 
         // When post-process shaders are active, schedule continuous redraws
-        // so that time-based shader effects animate smoothly
-        if self.post_process.is_some() {
+        // so that time-based shader effects animate smoothly.
+        // custom_shader_fps caps the repaint rate; 0 disables continuous
+        // repaints for purely static shaders.
+        if self.post_process.is_some() && self.config.custom_shader_fps > 0 {
             let mut anim = self.has_animation.borrow_mut();
-            let next = Instant::now() + Duration::from_millis(16);
+            let interval_ms = 1000u64 / self.config.custom_shader_fps.max(1) as u64;
+            let next = Instant::now() + Duration::from_millis(interval_ms);
             match *anim {
                 Some(existing) if existing <= next => {}
                 _ => {
