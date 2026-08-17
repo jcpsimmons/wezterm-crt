@@ -4,7 +4,7 @@ This directory contains a full port of
 [cool-retro-term](https://github.com/Swordfish90/cool-retro-term)'s CRT
 effects to wezterm's WebGPU post-processing pipeline.
 
-![effects] screen curvature, scanline/pixel/subpixel rasterization,
+**Effects:** screen curvature, scanline/pixel/subpixel rasterization,
 bloom, burn-in (phosphor trails), static noise, jitter, glowing scan
 line, screen flicker, horizontal sync distortion, RGB shift,
 chroma/monochrome phosphor palettes, and a bezel frame with ambient
@@ -121,6 +121,36 @@ cargo test -p config -p wezterm-gui
 
 If upstream merges PR #7649, drop the first commit during the rebase
 (`git rebase --onto origin/main <pick-commit>`) and keep the rest.
+
+## Release builds via CI
+
+The fork reuses wezterm's own build workflows. The
+`*_continuous` workflows (`gen_<platform>_continuous.yml`) have a
+`workflow_dispatch` trigger added, so you can build installable
+packages for any branch without waiting for the nightly cron:
+
+1. On your fork, go to **Actions**, pick the platform workflow (e.g.
+   `ubuntu24.04_continuous`, `macos_continuous`,
+   `windows_continuous`), press **Run workflow**, and select this
+   branch.
+2. The build job attaches the packages (`.deb`/`.rpm`/`.AppImage`,
+   `.zip` for macOS/Windows) as workflow artifacts, downloadable from
+   the run page for 5 days.
+3. The final "upload to nightly release" job additionally publishes
+   the assets to a GitHub release tagged `nightly`. For that step to
+   succeed on a fork, create the release once:
+
+   ```sh
+   gh release create nightly --prerelease --title Nightly \
+     --notes "rolling build of the CRT effects branch"
+   ```
+
+   If the release does not exist that job fails harmlessly; the
+   artifacts from step 2 are unaffected.
+
+The tag workflows (`gen_<platform>_tag.yml`) fire on tags matching
+`20*` and create versioned releases, same as upstream's release
+process, if you prefer pinned versions over the rolling nightly.
 
 ## License note
 

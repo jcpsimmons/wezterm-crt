@@ -1,6 +1,7 @@
 name: ubuntu26.04_continuous
 
 on:
+  workflow_dispatch: {}
   schedule:
     - cron: "10 3 * * *"
   push:

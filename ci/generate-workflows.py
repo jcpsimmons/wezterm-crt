@@ -1127,11 +1127,14 @@ on:
 
 
 def continuous_actions():
+    # workflow_dispatch allows forks (e.g. the CRT effects fork) to
+    # manually produce nightly builds for any branch from the Actions tab.
     generate_actions(
         lambda t: f"{t.name}_continuous",
         lambda t: t.continuous(),
         trigger="""
 on:
+  workflow_dispatch: {}
   schedule:
     - cron: "10 3 * * *"
   push:
