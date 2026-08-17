@@ -8,7 +8,7 @@
 --
 --   local crt = dofile(wezterm.config_dir .. "/crt.lua")
 --   crt.apply_to_config(config, {
---     preset = "monochrome_green",  -- see crt.presets
+--     preset = "ibm_dos",  -- see crt.presets; default
 --     -- any field below can be overridden
 --   })
 --
@@ -31,7 +31,7 @@
 --     frame_size (CRT frameMargin; 0 hides bezel), frame_color "#rrggbb",
 --     screen_radius, virtual_pixel_size (device px, default 3)
 --   apply_to_config extras:
---     preset, fps (default 60), output_path, template_path
+--     preset, fps (default 30), output_path, template_path
 --
 -- Not ported (use wezterm.lua): font, opacity, padding, cursor, cols/rows.
 
@@ -119,6 +119,19 @@ M.presets = {
     screen_radius = 0.1, static_noise = 0.0, frame_size = 0.1,
     frame_color = "#ffffff", frame_shininess = 0.3,
   },
+  -- cool-retro-term "IBM Dos" with the tuned Effects / Screen / Performance
+  -- sliders used as wezterm-crt stock defaults: full-color phosphor, no
+  -- bezel, bloom + RGB shift + flicker, 30 FPS.
+  ibm_dos = {
+    ambient_light = 0.0, background_color = "#000000", bloom = 0.36,
+    brightness = 0.56, burn_in = 0.0, chroma_color = 1.0, contrast = 0.95,
+    flickering = 0.19, font_color = "#ffffff", glowing_line = 0.0,
+    horizontal_sync = 0.0, jitter = 0.20, rasterization = "none",
+    rgb_shift = 0.30, saturation_color = 0.0, screen_curvature = 0.0,
+    screen_radius = 0.0, static_noise = 0.0, frame_size = 0.0,
+    frame_color = "#ffffff", frame_shininess = 0.2,
+    fps = 30,
+  },
   ibm_3278 = {
     ambient_light = 0.2, background_color = "#000000", bloom = 0.2,
     brightness = 0.5, burn_in = 0.5, chroma_color = 0, contrast = 0.8,
@@ -187,7 +200,7 @@ M.presets = {
   },
 }
 
-M.default_preset = "monochrome_green"
+M.default_preset = "ibm_dos"
 
 -- ---------------------------------------------------------------------
 -- color helpers
@@ -352,12 +365,12 @@ end
 -- ---------------------------------------------------------------------
 
 -- opts:
---   preset: name from M.presets (default "monochrome_green")
+--   preset: name from M.presets (default "ibm_dos")
 --   output_path: where to write the generated shader
 --     (default: alongside this file, named crt-generated-<preset>.wgsl)
 --   template_path: the crt.wgsl template
 --     (default: crt.wgsl alongside this file)
---   fps: repaint rate cap for the animation (default 60)
+--   fps: repaint rate cap for the animation (default 30)
 --   any profile field (screen_curvature, bloom, font_color, ...) to
 --   override the preset value.
 function M.apply_to_config(config, opts)
@@ -405,7 +418,7 @@ function M.apply_to_config(config, opts)
   config.custom_shaders = { output_path }
   config.custom_shader_burn_in = profile.burn_in or 0
   config.custom_shader_bloom = (profile.bloom or 0) > 0
-  config.custom_shader_fps = opts.fps or 60
+  config.custom_shader_fps = opts.fps or profile.fps or 30
 
   return config
 end

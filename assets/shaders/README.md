@@ -20,7 +20,7 @@ local wezterm = require 'wezterm'
 local config = wezterm.config_builder()
 
 local crt = dofile(wezterm.config_dir .. '/crt.lua')
-crt.apply_to_config(config, { preset = 'monochrome_green' })
+crt.apply_to_config(config, { preset = 'ibm_dos' })
 
 return config
 ```
@@ -39,7 +39,8 @@ All of cool-retro-term's built-in profiles are included:
 | preset | look |
 |---|---|
 | `default_amber` | amber phosphor, soft bloom |
-| `monochrome_green` | classic green phosphor (default) |
+| `monochrome_green` | classic green phosphor |
+| `ibm_dos` | IBM Dos, full-color, no bezel (default) |
 | `deep_blue` | blue-white with strong curvature |
 | `commodore_64` | blue-on-blue, scanlines, chunky bezel |
 | `commodore_pet` | white phosphor, heavy curvature and flicker |
@@ -112,10 +113,15 @@ color scheme stays, CRT hardware effects still apply.
 
 | option | default | what it does |
 |---|---|---|
-| `preset` | `monochrome_green` | starting profile; overrides apply on top |
-| `fps` | `60` | shader animation cap (`custom_shader_fps`) |
+| `preset` | `ibm_dos` | starting profile; overrides apply on top |
+| `fps` | `30` | shader animation cap (`custom_shader_fps`) |
 | `output_path` | `crt-generated-<preset>.wgsl` next to `crt.lua` | where the baked shader is written |
 | `template_path` | `crt.wgsl` next to `crt.lua` | shader template |
+
+cool-retro-term's Performance tab **Texture Quality / Bloom Quality /
+BurnIn Quality** are not exposed. Bloom is already a quarter-resolution
+blur (CRT's 50% bloom quality). Texture quality is wezterm's native
+framebuffer.
 
 ### Use wezterm for these CRT settings
 

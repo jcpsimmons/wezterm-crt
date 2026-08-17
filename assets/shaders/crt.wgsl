@@ -3,12 +3,12 @@
 //
 // Usage (wezterm.lua):
 //   local crt = dofile("/path/to/wezterm/assets/shaders/crt.lua")
-//   crt.apply_to_config(config, { preset = "monochrome_green" })
+//   crt.apply_to_config(config, { preset = "ibm_dos" })
 //
 // or use this file directly with the built-in default look:
 //   config.front_end = "WebGpu"
 //   config.custom_shaders = { "/path/to/crt.wgsl" }
-//   config.custom_shader_burn_in = 0.3   -- phosphor trails
+//   config.custom_shader_burn_in = 0.0   -- phosphor trails
 //   config.custom_shader_bloom = true    -- true gaussian bloom
 //
 // The struct/binding declarations (screen_texture, burnin_texture,
@@ -22,27 +22,27 @@
 // conversion, bezel frame with ambient light and reflections.
 
 // -- BEGIN CRT PARAMS --
-// Values below correspond to cool-retro-term's "Monochrome Green"
-// profile. crt.lua rewrites this block from a preset + overrides.
-const AMBIENT_LIGHT: f32 = 0.3;
-const BLOOM: f32 = 0.5;
-const BRIGHTNESS: f32 = 0.5;
-const CHROMA_COLOR: f32 = 0.0;
-const FLICKERING: f32 = 0.1;
-const FONT_COLOR: vec3<f32> = vec3<f32>(0.0470, 0.8000, 0.4078);
-const BACKGROUND_COLOR: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
-const FRAME_COLOR: vec3<f32> = vec3<f32>(0.4256, 0.6046, 0.5142);
-const FRAME_SHININESS: f32 = 0.1;
-const FRAME_SIZE: f32 = 0.005;
-const GLOWING_LINE: f32 = 0.2;
-const HORIZONTAL_SYNC: f32 = 0.1;
-const JITTER: f32 = 0.2;
-const RASTERIZATION: i32 = 1;
-const RGB_SHIFT: f32 = 0.0;
-const SCREEN_CURVATURE: f32 = 0.12;
-const SCREEN_RADIUS: f32 = 0.2;
-const STATIC_NOISE: f32 = 0.1;
-const VIRTUAL_PIXEL_SIZE: f32 = 3.0;
+// Values below correspond to the stock "ibm_dos" preset. crt.lua
+// rewrites this block from a preset + overrides.
+const AMBIENT_LIGHT: f32 = 0.0000;
+const BLOOM: f32 = 0.3600;
+const BRIGHTNESS: f32 = 0.5600;
+const CHROMA_COLOR: f32 = 1.0000;
+const FLICKERING: f32 = 0.1900;
+const FONT_COLOR: vec3<f32> = vec3<f32>(0.9850, 0.9850, 0.9850);
+const BACKGROUND_COLOR: vec3<f32> = vec3<f32>(0.0150, 0.0150, 0.0150);
+const FRAME_COLOR: vec3<f32> = vec3<f32>(0.2634, 0.2634, 0.2634);
+const FRAME_SHININESS: f32 = 0.2000;
+const FRAME_SIZE: f32 = 0.0000;
+const GLOWING_LINE: f32 = 0.0000;
+const HORIZONTAL_SYNC: f32 = 0.0000;
+const JITTER: f32 = 0.2000;
+const RASTERIZATION: i32 = 0;
+const RGB_SHIFT: f32 = 0.7500;
+const SCREEN_CURVATURE: f32 = 0.0000;
+const SCREEN_RADIUS: f32 = 0.0000;
+const STATIC_NOISE: f32 = 0.0000;
+const VIRTUAL_PIXEL_SIZE: f32 = 3.0000;
 // -- END CRT PARAMS --
 
 const PI: f32 = 3.141592654;
