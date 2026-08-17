@@ -133,8 +133,13 @@ impl crate::TermWindow {
 
         // If self.has_animation is some, then the last render detected
         // image attachments with multiple frames, so we also need to
-        // invalidate the viewport when the next frame is due
-        if self.focused.is_some() {
+        // invalidate the viewport when the next frame is due.
+        // Animated post-process shaders (CRT effects and the like) keep
+        // running even without focus, matching cool-retro-term behavior;
+        // burn-in decay in particular looks wrong if repaints stop.
+        let animate_post_process =
+            self.post_process.is_some() && self.config.custom_shader_fps > 0;
+        if self.focused.is_some() || animate_post_process {
             if let Some(next_due) = *self.has_animation.borrow() {
                 let prior = self.scheduled_animation.borrow_mut().take();
                 match prior {
